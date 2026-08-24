@@ -19,6 +19,12 @@ library(arrow)
 library(httr2)
 library(xml2)
 
+# Connect Cloud launches the app via its primary file, which skips Shiny's
+# automatic sourcing of the R/ directory — source the helpers explicitly.
+# (Harmless locally, where autoload has already loaded them.)
+source("R/helpers.R", local = TRUE)
+source("R/trackman_api.R", local = TRUE)
+
 # ---- UI ---------------------------------------------------------------------
 ui <- page_navbar(
   title = "Bullpen Central",
