@@ -1,16 +1,3 @@
-# =============================================================================
-# R/supabase.R — Bullpen Central's read-only connection to Supabase.
-#
-# Uses the `bullpen_reader` Postgres role (SELECT-only) through Supabase's
-# transaction pooler. All credentials arrive as environment variables:
-# on Posit Connect Cloud set them in the content's Variables/Secrets panel;
-# locally put the same names in ~/.Renviron.
-#
-#   SB_DB_HOST  e.g. aws-1-us-east-1.pooler.supabase.com   (from Connect dialog)
-#   SB_DB_USER  e.g. bullpen_reader.ryqzkosdbksawrcrdqrc   (role.projectref)
-#   SB_DB_PASS  the bullpen_reader password you invented in schema.sql
-# =============================================================================
-
 library(pool)
 library(RPostgres)
 library(DBI)
@@ -28,7 +15,7 @@ sb_pool <- local({
     p <<- pool::dbPool(
       RPostgres::Postgres(),
       host     = host,
-      port     = 6543,          # Supabase transaction pooler (NOT 5432)
+      port     = 6543,          
       dbname   = "postgres",
       user     = user,
       password = pass,
@@ -76,8 +63,9 @@ load_pitches <- function() {
     order by session_date, pitch_no
   '
   d <- DBI::dbGetQuery(sb_pool(), sql)
+  if (nrow(d) == 0) return(NULL)
   d$date <- as.Date(d$date)
-  if (!"SpinAxis3dActiveSpinRate" %in% names(d)) d$SpinAxis3dActiveSpinRate <- NA_real_
+  d$SpinAxis3dActiveSpinRate <- NA_real_
   d
 }
 
