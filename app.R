@@ -1,11 +1,14 @@
 # =============================================================================
-# Bullpen Central — TrackMan practice bullpens with Edgertronic video.
+# Bullpen Central — TrackMan practice bullpens with Edgertronic + AWRE video.
 #
-# Data comes from Supabase (`pitches` table, filled nightly by
-# trackman_practice_ingest.R). The app polls for new rows once a minute, so
-# fresh bullpens appear without a redeploy. Clicking any pitch — in a chart
-# or the game log — mints a fresh SAS URL and plays the Edger clip in a modal.
-# TrackMan credentials are still needed here, but ONLY for video-URL minting.
+# Data: Supabase `pitches` (filled by trackman_practice_ingest.R), polled
+# every minute. Clicking a pitch opens a modal with:
+#   * Edgertronic clip(s)  — SAS URL minted at click time (trackman_api.R)
+#   * AWRE angles          — fetched at click time from
+#                            /team/{team}/clip/{sl_key}/angles, played via
+#                            hls.js (AWRE serves HLS .m3u8 streams)
+# Secrets (Connect Cloud Variables / ~/.Renviron): SB_DB_HOST, SB_DB_USER,
+# SB_DB_PASS, TM_CLIENT_ID, TM_SECRET, AWRE_KEY.
 # =============================================================================
 
 library(shiny)
@@ -22,17 +25,61 @@ library(pool)
 library(RPostgres)
 library(DBI)
 
-# Connect Cloud launches the app via its primary file, which skips Shiny's
-# automatic sourcing of the R/ directory — source the helpers explicitly.
-# (Harmless locally, where autoload has already loaded them.)
 source("R/helpers.R", local = TRUE)
-source("R/trackman_api.R", local = TRUE)   # still provides edger_urls()
+source("R/trackman_api.R", local = TRUE)   # edger_urls()
 source("R/supabase.R", local = TRUE)
+
+AWRE_TEAM <- "73715"
+AWRE_API  <- "https://api.awresports.com/api/exchange/v2"
+
+# Fetch AWRE camera angles for one pitch (sl_ key). Returns a named character
+# vector: names = perspective labels, values = HLS urls. NULL on any failure.
+awre_angles <- function(ppdk) {
+  key <- Sys.getenv("AWRE_KEY")
+  if (!nzchar(key) || is.na(ppdk) || !nzchar(ppdk)) return(NULL)
+  resp <- request(paste0(AWRE_API, "/team/", AWRE_TEAM, "/clip/", ppdk, "/angles")) |>
+    req_headers(Authorization = paste("Api-Key", key),
+                Accept = "application/json") |>
+    req_retry(max_tries = 2) |>
+    req_error(is_error = function(resp) FALSE) |>
+    req_perform()
+  if (resp_status(resp) >= 400) return(NULL)
+  body <- tryCatch(resp_body_json(resp, simplifyVector = FALSE),
+                   error = function(e) NULL)
+  clips <- body$clips %||% list()
+  clips <- keep(clips, ~ !identical(.x$perspective, "All"))   # composite stream: skip
+  if (!length(clips)) return(NULL)
+  stats::setNames(map_chr(clips, ~ .x$video_url %||% NA_character_),
+                  map_chr(clips, ~ .x$perspective %||% "Angle"))
+}
 
 # ---- UI ---------------------------------------------------------------------
 ui <- page_navbar(
   title = "Bullpen Central",
   theme = bs_theme(version = 5, bootswatch = "flatly", primary = "#006F71"),
+  header = tags$head(
+    tags$script(src = "https://cdn.jsdelivr.net/npm/hls.js@1"),
+    tags$script(HTML("
+      Shiny.addCustomMessageHandler('play_hls', function(msg) {
+        var tries = 0;
+        function go() {
+          var v = document.getElementById(msg.id);
+          if (!v) { if (tries++ < 20) setTimeout(go, 100); return; }
+          if (v._hls) { v._hls.destroy(); v._hls = null; }
+          if (v.canPlayType('application/vnd.apple.mpegurl')) {
+            v.src = msg.url; v.play();
+          } else if (window.Hls && Hls.isSupported()) {
+            var h = new Hls();
+            h.loadSource(msg.url);
+            h.attachMedia(v);
+            v._hls = h;
+            h.on(Hls.Events.MANIFEST_PARSED, function() { v.play(); });
+          }
+        }
+        go();
+      });
+    "))
+  ),
   sidebar = sidebar(
     width = 320,
     selectInput("pitcher", "Pitcher", choices = NULL),
@@ -40,7 +87,7 @@ ui <- page_navbar(
     hr(),
     p(class = "text-muted small",
       icon("database"),
-      " Data syncs from TrackMan automatically each night. ",
+      " Data syncs from TrackMan + AWRE automatically each night. ",
       "New bullpens appear here within a minute of ingest.")
   ),
 
@@ -60,7 +107,7 @@ ui <- page_navbar(
            plotly::plotlyOutput("bp_location_plot", height = "430px"))
     ),
     p(class = "text-muted small ps-2",
-      icon("circle-play"), " Click any pitch in a chart to watch its Edgertronic clip.")
+      icon("circle-play"), " Click any pitch in a chart to watch its video.")
   ),
 
   nav_panel(
@@ -75,7 +122,6 @@ ui <- page_navbar(
 # ---- Server -----------------------------------------------------------------
 server <- function(input, output, session) {
 
-  # Re-query only when the ingest job has actually written something new.
   db_version <- reactivePoll(
     60 * 1000, session,
     checkFunc = pitches_version,
@@ -109,7 +155,8 @@ server <- function(input, output, session) {
       dplyr::filter(Pitcher == input$pitcher) |>
       dplyr::group_by(SessionId) |>
       dplyr::summarise(date = max(date), n = dplyr::n(),
-                       vids = sum(has_edger, na.rm = TRUE), .groups = "drop") |>
+                       vids = sum(has_edger | has_awre, na.rm = TRUE),
+                       .groups = "drop") |>
       dplyr::arrange(dplyr::desc(date))
     req(nrow(ses) > 0)
     labels <- sprintf("%s — %d pitches%s",
@@ -264,7 +311,6 @@ server <- function(input, output, session) {
       "<br>Eff: ", fmt_pct(SpinAxis3dSpinEfficiency)))
     zl <- -0.8333; zr <- 0.8333; zb <- 1.5; zt <- 3.5
     p <- ggplot(df, aes(PlateLocSide, PlateLocHeight)) +
-      # home plate (catcher's view)
       annotate("segment", x = -0.85, xend = 0.85, y = 0.15, yend = 0.15,
                color = "black", linewidth = 0.6) +
       annotate("segment", x = -0.85, xend = -0.85, y = 0.15, yend = 0.3,
@@ -298,7 +344,7 @@ server <- function(input, output, session) {
     log_df <- df |>
       dplyr::transmute(
         `#`    = PitchNo,
-        Time   = substr(Time, 12, 19),   # timestamptz text: keep HH:MM:SS
+        Time   = substr(Time, 12, 19),
         Pitch  = TaggedPitchType,
         Velo   = round(RelSpeed, 1),
         Spin   = round(SpinRate),
@@ -311,13 +357,12 @@ server <- function(input, output, session) {
         Ext    = round(Extension, 2),
         VAA    = round(VertApprAngle, 1),
         Zone   = ifelse(in_zone(PlateLocSide, PlateLocHeight), "In", "Out"),
-        Video  = ifelse(
-          has_edger & !is.na(PlayID),
-          sprintf(paste0(
+        Video  = dplyr::case_when(
+          (has_edger | has_awre) & !is.na(PlayID) ~ sprintf(paste0(
             '<button class="btn btn-sm btn-primary" ',
             'onclick="Shiny.setInputValue(\'watch_play\', \'%s\', ',
             '{priority: \'event\'})">&#9658; Watch</button>'), PlayID),
-          '<span class="text-muted">—</span>')
+          TRUE ~ '<span class="text-muted">—</span>')
       )
     DT::datatable(
       log_df, escape = FALSE, rownames = FALSE,
@@ -328,33 +373,67 @@ server <- function(input, output, session) {
     )
   })
 
-  # -- Video: chart clicks + game-log buttons ---------------------------------
+  # -- Video modal: Edgertronic + AWRE ----------------------------------------
+  awre_current <- reactiveVal(NULL)   # named vector: perspective -> HLS url
+
   show_video <- function(play_id) {
     d <- all_data(); req(d)
     row <- d |> dplyr::filter(PlayID == play_id) |> dplyr::slice(1)
-    if (!nrow(row) || is.na(row$edger_blob)) {
-      showNotification("No Edgertronic video for this pitch.", type = "warning")
+    if (!nrow(row)) return(invisible(NULL))
+
+    has_e <- isTRUE(row$has_edger) && !is.na(row$edger_blob)
+    has_a <- isTRUE(row$has_awre)  && !is.na(row$awre_ppdk)
+    if (!has_e && !has_a) {
+      showNotification("No video for this pitch.", type = "warning")
       return(invisible(NULL))
     }
-    blobs <- strsplit(
-      if (!is.na(row$edger_all_blobs) && nzchar(row$edger_all_blobs))
-        row$edger_all_blobs else row$edger_blob,
-      "|", fixed = TRUE)[[1]]
-    urls <- tryCatch(edger_urls(row$SessionId, blobs), error = function(e) {
-      showNotification(paste("Could not mint video URL:", conditionMessage(e)),
-                       type = "error")
-      NULL
-    })
-    if (is.null(urls) || !length(urls) || all(is.na(urls))) return(invisible(NULL))
+
+    # Edgertronic: mint SAS urls now
+    edger_tags <- NULL
+    if (has_e) {
+      blobs <- strsplit(
+        if (!is.na(row$edger_all_blobs) && nzchar(row$edger_all_blobs))
+          row$edger_all_blobs else row$edger_blob,
+        "|", fixed = TRUE)[[1]]
+      urls <- tryCatch(edger_urls(row$SessionId, blobs), error = function(e) NULL)
+      if (!is.null(urls) && length(urls) && !all(is.na(urls))) {
+        edger_tags <- tagList(
+          h6(class = "mt-1", icon("bolt"), " Edgertronic",
+             if (!is.na(row$framerate))
+               span(class = "text-muted small",
+                    sprintf("  %s fps", format(row$framerate, big.mark = ",")))),
+          lapply(urls[!is.na(urls)], function(u)
+            tags$video(src = u, controls = NA, autoplay = has_e && !has_a,
+                       muted = NA, playsinline = NA,
+                       style = "width:100%; margin-bottom:8px; border-radius:6px;"))
+        )
+      }
+    }
+
+    # AWRE: fetch angle list now, play via hls.js
+    awre_tags <- NULL
+    awre_current(NULL)
+    if (has_a) {
+      angles <- tryCatch(awre_angles(row$awre_ppdk), error = function(e) NULL)
+      if (!is.null(angles) && length(angles)) {
+        awre_current(angles)
+        default <- if ("Bullpen" %in% names(angles)) "Bullpen" else names(angles)[1]
+        awre_tags <- tagList(
+          h6(class = "mt-2", icon("video"), " AWRE"),
+          radioButtons("awre_angle", NULL, choices = names(angles),
+                       selected = default, inline = TRUE),
+          tags$video(id = "awreVid", controls = NA, muted = NA, playsinline = NA,
+                     style = "width:100%; border-radius:6px; background:#000;")
+        )
+      }
+    }
 
     meta_bits <- c(
       if (!is.na(row$SpinRate))
         sprintf("%.0f rpm · %s eff", row$SpinRate,
-                fmt_pct(row$SpinAxis3dSpinEfficiency)),
-      if (!is.na(row$framerate))
-        sprintf("%s fps · %.1fs clip", format(row$framerate, big.mark = ","),
-                row$clip_seconds %||% NA))
+                fmt_pct(row$SpinAxis3dSpinEfficiency)))
     meta <- if (length(meta_bits)) paste(meta_bits, collapse = "  ·  ") else NULL
+
     showModal(modalDialog(
       title = sprintf("%s — %s, %s mph (Pitch %s)",
                       row$Pitcher, row$TaggedPitchType,
@@ -363,18 +442,29 @@ server <- function(input, output, session) {
                       ifelse(is.na(row$PitchNo), "—", row$PitchNo)),
       size = "l", easyClose = TRUE, footer = modalButton("Close"),
       if (!is.null(meta)) p(class = "text-muted small mb-2", meta),
-      lapply(urls[!is.na(urls)], function(u)
-        tags$video(src = u, controls = NA, autoplay = NA, muted = NA,
-                   playsinline = NA,
-                   style = "width: 100%; margin-bottom: 8px; border-radius: 6px;"))
+      edger_tags,
+      awre_tags
     ))
+
+    # kick off the default AWRE angle once the modal DOM exists
+    a <- awre_current()
+    if (!is.null(a)) {
+      default <- if ("Bullpen" %in% names(a)) "Bullpen" else names(a)[1]
+      session$sendCustomMessage("play_hls", list(id = "awreVid", url = a[[default]]))
+    }
   }
+
+  observeEvent(input$awre_angle, {
+    a <- awre_current()
+    if (is.null(a) || !(input$awre_angle %in% names(a))) return()
+    session$sendCustomMessage("play_hls",
+                              list(id = "awreVid", url = a[[input$awre_angle]]))
+  }, ignoreInit = TRUE)
 
   lapply(c("bp_move", "bp_rel", "bp_loc"), function(src) {
     observeEvent(plotly::event_data("plotly_click", source = src), {
       ed <- plotly::event_data("plotly_click", source = src)
       pid <- ed$customdata
-      # pitch-type average markers carry no customdata — ignore those clicks
       if (!is.null(pid) && length(pid) && !is.na(pid[1])) show_video(pid[1])
     })
   })
