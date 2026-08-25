@@ -410,21 +410,34 @@ server <- function(input, output, session) {
       }
     }
 
-    # AWRE: fetch angle list now, play via hls.js
+    # AWRE: fetch angle list now, play via hls.js — loud about every failure
     awre_tags <- NULL
     awre_current(NULL)
     if (has_a) {
-      angles <- tryCatch(awre_angles(row$awre_ppdk), error = function(e) NULL)
-      if (!is.null(angles) && length(angles)) {
-        awre_current(angles)
-        default <- if ("Bullpen" %in% names(angles)) "Bullpen" else names(angles)[1]
-        awre_tags <- tagList(
-          h6(class = "mt-2", icon("video"), " AWRE"),
-          radioButtons("awre_angle", NULL, choices = names(angles),
-                       selected = default, inline = TRUE),
-          tags$video(id = "awreVid", controls = NA, muted = NA, playsinline = NA,
-                     style = "width:100%; border-radius:6px; background:#000;")
-        )
+      if (!nzchar(Sys.getenv("AWRE_KEY"))) {
+        showNotification(
+          "AWRE_KEY is not set in this R session — add AWRE_KEY=... to ~/.Renviron, restart R, relaunch the app.",
+          type = "warning", duration = 10)
+      } else {
+        angles <- tryCatch(awre_angles(row$awre_ppdk), error = function(e) {
+          showNotification(paste("AWRE request error:", conditionMessage(e)),
+                           type = "error", duration = 10); NULL })
+        if (is.null(angles) || !length(angles)) {
+          showNotification(
+            paste0("AWRE returned no clips for ", row$awre_ppdk,
+                   " (key rejected, or clips missing)."),
+            type = "warning", duration = 10)
+        } else {
+          awre_current(angles)
+          default <- if ("Bullpen" %in% names(angles)) "Bullpen" else names(angles)[1]
+          awre_tags <- tagList(
+            h6(class = "mt-2", icon("video"), " AWRE"),
+            radioButtons("awre_angle", NULL, choices = names(angles),
+                         selected = default, inline = TRUE),
+            tags$video(id = "awreVid", controls = NA, muted = NA, playsinline = NA,
+                       style = "width:100%; border-radius:6px; background:#000;")
+          )
+        }
       }
     }
 
@@ -461,15 +474,21 @@ server <- function(input, output, session) {
                               list(id = "awreVid", url = a[[input$awre_angle]]))
   }, ignoreInit = TRUE)
 
+  safe_show_video <- function(pid) {
+    tryCatch(show_video(pid), error = function(e)
+      showNotification(paste("Video error:", conditionMessage(e)),
+                       type = "error", duration = 10))
+  }
+
   lapply(c("bp_move", "bp_rel", "bp_loc"), function(src) {
     observeEvent(plotly::event_data("plotly_click", source = src), {
       ed <- plotly::event_data("plotly_click", source = src)
       pid <- ed$customdata
-      if (!is.null(pid) && length(pid) && !is.na(pid[1])) show_video(pid[1])
+      if (!is.null(pid) && length(pid) && !is.na(pid[1])) safe_show_video(pid[1])
     })
   })
 
-  observeEvent(input$watch_play, show_video(input$watch_play))
+  observeEvent(input$watch_play, safe_show_video(input$watch_play))
 }
 
 shinyApp(ui, server)
