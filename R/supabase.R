@@ -1,3 +1,13 @@
+# =============================================================================
+# R/supabase.R — Bullpen Central's read-only connection to Supabase.
+# v2: adds pitch_uid / has_awre / awre_ppdk to the query.
+#
+# Env vars (Connect Cloud Variables panel; ~/.Renviron locally):
+#   SB_DB_HOST  e.g. aws-0-us-east-1.pooler.supabase.com
+#   SB_DB_USER  e.g. bullpen_reader.ryqzkosdbksawrcrdqrc
+#   SB_DB_PASS  the bullpen_reader password
+# =============================================================================
+
 library(pool)
 library(RPostgres)
 library(DBI)
@@ -15,7 +25,7 @@ sb_pool <- local({
     p <<- pool::dbPool(
       RPostgres::Postgres(),
       host     = host,
-      port     = 6543,          
+      port     = 6543,
       dbname   = "postgres",
       user     = user,
       password = pass,
@@ -26,10 +36,6 @@ sb_pool <- local({
   }
 })
 
-# One query, aliased straight to the camelCase names the app already uses,
-# so every plot / table / video handler downstream stays untouched.
-# edger_all_blobs (a Postgres text[]) is collapsed to the pipe-delimited
-# string the video modal splits on.
 load_pitches <- function() {
   sql <- '
     select
@@ -54,11 +60,14 @@ load_pitches <- function() {
       plate_loc_side                            as "PlateLocSide",
       plate_loc_height                          as "PlateLocHeight",
       spin_efficiency                           as "SpinAxis3dSpinEfficiency",
+      pitch_uid,
       coalesce(has_edger, false)                as "has_edger",
       edger_blob,
       array_to_string(edger_all_blobs, \'|\')   as "edger_all_blobs",
       framerate,
-      clip_seconds
+      clip_seconds,
+      coalesce(has_awre, false)                 as "has_awre",
+      awre_ppdk
     from pitches
     order by session_date, pitch_no
   '
@@ -69,8 +78,6 @@ load_pitches <- function() {
   d
 }
 
-# Cheap freshness probe for reactivePoll: changes whenever the ingest job
-# writes anything new.
 pitches_version <- function() {
   tryCatch(
     DBI::dbGetQuery(sb_pool(),
