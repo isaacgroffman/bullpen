@@ -29,6 +29,11 @@ source("R/helpers.R", local = TRUE)
 source("R/trackman_api.R", local = TRUE)   # edger_urls()
 source("R/supabase.R", local = TRUE)
 
+# Local-only secrets: R/secrets.R exists ONLY on your machine (gitignored).
+# On Connect Cloud it is absent and the Variables panel supplies the same
+# values as environment variables, so Sys.getenv() works in both worlds.
+if (file.exists("R/secrets.R")) source("R/secrets.R", local = TRUE)
+
 AWRE_TEAM <- "73715"
 AWRE_API  <- "https://api.awresports.com/api/exchange/v2"
 
@@ -64,16 +69,37 @@ ui <- page_navbar(
         var tries = 0;
         function go() {
           var v = document.getElementById(msg.id);
-          if (!v) { if (tries++ < 20) setTimeout(go, 100); return; }
+          if (!v || (!window.Hls && !document.createElement('video')
+                       .canPlayType('application/vnd.apple.mpegurl'))) {
+            if (tries++ < 40) { setTimeout(go, 150); }
+            else {
+              console.error('play_hls gave up', {element: !!v, hlsLib: !!window.Hls});
+              Shiny.setInputValue('hls_error',
+                'player never became ready (hls.js CDN blocked?)',
+                {priority: 'event'});
+            }
+            return;
+          }
           if (v._hls) { v._hls.destroy(); v._hls = null; }
-          if (v.canPlayType('application/vnd.apple.mpegurl')) {
-            v.src = msg.url; v.play();
-          } else if (window.Hls && Hls.isSupported()) {
+          if (window.Hls && Hls.isSupported()) {
             var h = new Hls();
+            h.on(Hls.Events.ERROR, function(e, data) {
+              console.error('hls error', data.type, data.details, data.fatal);
+              if (data.fatal) {
+                Shiny.setInputValue('hls_error',
+                  data.type + ' / ' + data.details, {priority: 'event'});
+              }
+            });
             h.loadSource(msg.url);
             h.attachMedia(v);
-            v._hls = h;
             h.on(Hls.Events.MANIFEST_PARSED, function() { v.play(); });
+            v._hls = h;
+          } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+            v.pause();
+            v.src = msg.url;
+            v.load();          // Safari ignores a src change without this
+            v.muted = true;
+            v.play();
           }
         }
         go();
@@ -466,6 +492,14 @@ server <- function(input, output, session) {
       session$sendCustomMessage("play_hls", list(id = "awreVid", url = a[[default]]))
     }
   }
+
+  observeEvent(input$hls_error, {
+    showNotification(
+      paste0("AWRE video can't stream in this browser yet (", input$hls_error,
+             "). Open this app in Safari — or on an iPad/iPhone — to watch, ",
+             "while we wait on AWRE to enable cross-origin streaming."),
+      type = "warning", duration = 15)
+  })
 
   observeEvent(input$awre_angle, {
     a <- awre_current()
