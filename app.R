@@ -1,10 +1,11 @@
 # =============================================================================
 # Bullpen Central — TrackMan practice bullpens with Edgertronic video.
 #
-# Reads the arrow dataset at PARQUET_ROOT (built by ingest_range() /
-# R/trackman_api.R). Clicking any pitch — in a chart or the game log —
-# mints a fresh SAS URL and plays the Edger clip in a modal. Files in R/
-# are sourced automatically by Shiny.
+# Data comes from Supabase (`pitches` table, filled nightly by
+# trackman_practice_ingest.R). The app polls for new rows once a minute, so
+# fresh bullpens appear without a redeploy. Clicking any pitch — in a chart
+# or the game log — mints a fresh SAS URL and plays the Edger clip in a modal.
+# TrackMan credentials are still needed here, but ONLY for video-URL minting.
 # =============================================================================
 
 library(shiny)
@@ -15,15 +16,18 @@ library(ggplot2)
 library(plotly)
 library(gt)
 library(DT)
-library(arrow)
 library(httr2)
 library(xml2)
+library(pool)
+library(RPostgres)
+library(DBI)
 
 # Connect Cloud launches the app via its primary file, which skips Shiny's
 # automatic sourcing of the R/ directory — source the helpers explicitly.
 # (Harmless locally, where autoload has already loaded them.)
 source("R/helpers.R", local = TRUE)
-source("R/trackman_api.R", local = TRUE)
+source("R/trackman_api.R", local = TRUE)   # still provides edger_urls()
+source("R/supabase.R", local = TRUE)
 
 # ---- UI ---------------------------------------------------------------------
 ui <- page_navbar(
@@ -34,18 +38,10 @@ ui <- page_navbar(
     selectInput("pitcher", "Pitcher", choices = NULL),
     selectInput("bp_session", "Bullpen session", choices = NULL),
     hr(),
-    accordion(
-      open = FALSE,
-      accordion_panel(
-        "Sync from TrackMan", icon = icon("cloud-arrow-down"),
-        dateRangeInput("sync_range", NULL,
-                       start = Sys.Date() - 14, end = Sys.Date()),
-        actionButton("sync", "Pull sessions", class = "btn-primary w-100"),
-        helpText("Downloads new practice sessions + the Edger video index ",
-                 "into the local parquet store. Already-ingested sessions ",
-                 "are skipped.")
-      )
-    )
+    p(class = "text-muted small",
+      icon("database"),
+      " Data syncs from TrackMan automatically each night. ",
+      "New bullpens appear here within a minute of ingest.")
   ),
 
   nav_panel(
@@ -79,20 +75,21 @@ ui <- page_navbar(
 # ---- Server -----------------------------------------------------------------
 server <- function(input, output, session) {
 
-  refresh <- reactiveVal(0)
+  # Re-query only when the ingest job has actually written something new.
+  db_version <- reactivePoll(
+    60 * 1000, session,
+    checkFunc = pitches_version,
+    valueFunc = function() Sys.time()
+  )
 
   all_data <- reactive({
-    refresh()
-    if (!dir.exists(PARQUET_ROOT) ||
-        !length(list.files(PARQUET_ROOT, recursive = TRUE,
-                           pattern = "\\.parquet$"))) return(NULL)
-    d <- arrow::open_dataset(PARQUET_ROOT) |>
-      dplyr::collect() |>
-      dplyr::mutate(date = as.Date(as.character(date)))
-    # older ingests / portable-unit exports may lack the 3d-spin columns
-    for (col in c("SpinAxis3dSpinEfficiency", "SpinAxis3dActiveSpinRate")) {
-      if (!col %in% names(d)) d[[col]] <- NA_real_
-    }
+    db_version()
+    d <- tryCatch(load_pitches(), error = function(e) {
+      showNotification(paste("Database error:", conditionMessage(e)),
+                       type = "error", duration = 10)
+      NULL
+    })
+    if (is.null(d) || !nrow(d)) return(NULL)
     d
   })
 
@@ -119,8 +116,11 @@ server <- function(input, output, session) {
                       format(ses$date, "%b %d, %Y"), ses$n,
                       ifelse(ses$vids > 0,
                              sprintf("  (%d videos)", ses$vids), ""))
+    sel <- isolate(input$bp_session)
     updateSelectInput(session, "bp_session",
-                      choices = stats::setNames(ses$SessionId, labels))
+                      choices = stats::setNames(ses$SessionId, labels),
+                      selected = if (!is.null(sel) && sel %in% ses$SessionId) sel
+                                 else ses$SessionId[1])
   })
 
   bp_session_df <- reactive({
@@ -298,7 +298,7 @@ server <- function(input, output, session) {
     log_df <- df |>
       dplyr::transmute(
         `#`    = PitchNo,
-        Time   = substr(Time, 1, 8),
+        Time   = substr(Time, 12, 19),   # timestamptz text: keep HH:MM:SS
         Pitch  = TaggedPitchType,
         Velo   = round(RelSpeed, 1),
         Spin   = round(SpinRate),
@@ -337,7 +337,8 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
     blobs <- strsplit(
-      if (!is.na(row$edger_all_blobs)) row$edger_all_blobs else row$edger_blob,
+      if (!is.na(row$edger_all_blobs) && nzchar(row$edger_all_blobs))
+        row$edger_all_blobs else row$edger_blob,
       "|", fixed = TRUE)[[1]]
     urls <- tryCatch(edger_urls(row$SessionId, blobs), error = function(e) {
       showNotification(paste("Could not mint video URL:", conditionMessage(e)),
@@ -379,51 +380,6 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$watch_play, show_video(input$watch_play))
-
-  # -- Sync from TrackMan -----------------------------------------------------
-  observeEvent(input$sync, {
-    withProgress(message = "Syncing from TrackMan…", value = 0, {
-      n <- tryCatch(
-        ingest_range(input$sync_range[1], input$sync_range[2],
-                     progress = function(frac, msg)
-                       setProgress(frac, detail = msg)),
-        error = function(e) {
-          showNotification(paste("Sync failed:", conditionMessage(e)),
-                           type = "error", duration = 10)
-          NULL
-        })
-      if (!is.null(n)) {
-        showNotification(
-          if (n > 0) sprintf("Ingested %d new pitches.", n)
-          else "No new sessions in that range.",
-          type = "message")
-        if (n > 0) refresh(refresh() + 1)
-      }
-    })
-  })
-
-  # -- Auto-load on cold start ------------------------------------------------
-  # Deployed storage (Connect Cloud) is ephemeral: a fresh instance has an
-  # empty parquet cache, so the first session pulls the recent window from the
-  # TrackMan API automatically. The cache is skip-on-resume, so a second
-  # simultaneous visitor at worst re-discovers and skips.
-  observeEvent(TRUE, {
-    if (!is.null(all_data())) return()
-    days <- as.integer(Sys.getenv("BP_AUTOLOAD_DAYS", "30"))
-    withProgress(message = "Loading bullpens from TrackMan…", value = 0, {
-      n <- tryCatch(
-        ingest_range(Sys.Date() - days, Sys.Date(),
-                     progress = function(frac, msg)
-                       setProgress(frac, detail = msg)),
-        error = function(e) {
-          showNotification(
-            paste("Initial load failed:", conditionMessage(e)),
-            type = "error", duration = NULL)
-          NULL
-        })
-      if (!is.null(n) && n > 0) refresh(refresh() + 1)
-    })
-  }, once = TRUE)
 }
 
 shinyApp(ui, server)
